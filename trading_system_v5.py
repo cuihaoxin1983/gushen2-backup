@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-股神2号 - v5.4 自适应策略系统
+股神2号 - v5.5 信号历史验证系统
 ======================================
-核心进化：
-1. 增大验证窗口到20天（足够策略产生信号）
-2. 趋势跟踪+均值回归双策略并行
-3. 参数稳定性过滤（参数在连续窗口保持一致=可靠）
-4. 市场状态自适应（下跌趋势用均值回归，上涨用趋势跟踪）
-5. Walk-Forward验证 + 最新窗口参数双重确认
+核心理念：今天的信号，在历史上出现时，赚钱吗？
+
+不再问："哪个参数最优？"
+而是问："今天这个信号，历史胜率多少？"
+
+原理：
+1. 用指标规则生成"买入信号"（如RSI<30）
+2. 在历史数据中，找到所有出现同样信号的日子
+3. 如果信号后价格上涨 → 成功案例
+4. VectorBT模拟：每次信号出现时买入，持有N天后卖出
+5. 统计所有历史案例的胜率、平均收益
+6. → 得到"这个信号的历史置信度"
 """
 
 import sys
@@ -94,7 +100,6 @@ def calc_indicators(df):
 
     vol_annual = close.pct_change().rolling(20).std() * np.sqrt(250)
 
-    # 市场状态：最近20天趋势
     trend_20d = (close.iloc[-1] / close.iloc[-20] - 1) if len(close) >= 20 else 0
     market_state = 'down' if trend_20d < -0.05 else ('up' if trend_20d > 0.05 else 'range')
 
@@ -128,7 +133,6 @@ def run_bt(close, entries, exits, fees=0.0003, slippage=0.0002):
             peak = eq.cummax()
             dd = (peak - eq) / peak
             max_dd = dd.max()
-            calmar = (rets.mean() * 250) / max_dd if max_dd > 0 else 0
             wins = rets[rets > 0].sum()
             losses = abs(rets[rets < 0].sum())
             pf_ratio = wins / losses if losses > 0 else 999
@@ -140,7 +144,6 @@ def run_bt(close, entries, exits, fees=0.0003, slippage=0.0002):
             'dd': s['Max Drawdown [%]'],
             'sharpe': sharpe,
             'sortino': sortino,
-            'calmar': calmar,
             'pf': pf_ratio,
             'wr': s['Win Rate [%]'] / 100 if not np.isnan(s['Win Rate [%]']) else 0,
             'trades': int(s['Total Trades']),
@@ -149,428 +152,231 @@ def run_bt(close, entries, exits, fees=0.0003, slippage=0.0002):
     except:
         return None
 
-# ============ 策略库 ============
+# ============ 信号历史验证 ============
 
-def ma_strategy(data, params=None):
-    """均线策略 - 趋势跟踪"""
-    close = data['close'] if isinstance(data, pd.DataFrame) else data
-    results = []
-
-    if params is None:
-        for fast in [3, 5, 7, 10]:
-            for slow in [15, 20, 30]:
-                if fast >= slow:
-                    continue
-                mf = close.rolling(fast).mean()
-                ms = close.rolling(slow).mean()
-                entries = (mf > ms) & (mf.shift(1) <= ms.shift(1))
-                exits = (mf < ms) & (mf.shift(1) >= ms.shift(1))
-                r = run_bt(close, entries, exits)
-                if r and r['trades'] >= 2:
-                    results.append({
-                        'params_str': f'MA({fast}/{slow})',
-                        'params_raw': ('ma', fast, slow),
-                        **r
-                    })
-        results.sort(key=lambda x: x['sharpe'], reverse=True)
-    else:
-        strat, fast, slow = params
-        mf = close.rolling(fast).mean()
-        ms = close.rolling(slow).mean()
-        entries = (mf > ms) & (mf.shift(1) <= ms.shift(1))
-        exits = (mf < ms) & (mf.shift(1) >= ms.shift(1))
-        r = run_bt(close, entries, exits)
-        if r:
-            results.append(r)
-    return results
-
-def macd_strategy(data, params=None):
-    """MACD策略 - 趋势跟踪"""
-    close = data['close'] if isinstance(data, pd.DataFrame) else data
-    results = []
-
-    if params is None:
-        for fast in [5, 8, 12]:
-            for slow in [15, 20, 26]:
-                for sig in [5, 7, 9]:
-                    if fast >= slow:
-                        continue
-                    ef = close.ewm(span=fast).mean()
-                    es = close.ewm(span=slow).mean()
-                    macd_val = ef - es
-                    signal_val = macd_val.ewm(span=sig).mean()
-                    entries = (macd_val > signal_val) & (macd_val.shift(1) <= signal_val.shift(1))
-                    exits = (macd_val < signal_val) & (macd_val.shift(1) >= signal_val.shift(1))
-                    r = run_bt(close, entries, exits)
-                    if r and r['trades'] >= 2:
-                        results.append({
-                            'params_str': f'MACD({fast},{slow},{sig})',
-                            'params_raw': ('macd', fast, slow, sig),
-                            **r
-                        })
-        results.sort(key=lambda x: x['sharpe'], reverse=True)
-    else:
-        strat, fast, slow, sig = params
-        ef = close.ewm(span=fast).mean()
-        es = close.ewm(span=slow).mean()
-        macd_val = ef - es
-        signal_val = macd_val.ewm(span=sig).mean()
-        entries = (macd_val > signal_val) & (macd_val.shift(1) <= signal_val.shift(1))
-        exits = (macd_val < signal_val) & (macd_val.shift(1) >= signal_val.shift(1))
-        r = run_bt(close, entries, exits)
-        if r:
-            results.append(r)
-    return results
-
-def rsi_strategy(data, params=None):
-    """RSI均值回归策略 - 震荡市场"""
-    close = data['close'] if isinstance(data, pd.DataFrame) else data
-    results = []
-
-    if params is None:
-        for period in [6, 10, 14]:
-            for oversold in [25, 30, 35]:
-                for overbought in [65, 70, 75]:
-                    if oversold >= overbought:
-                        continue
-
-                    delta = close.diff()
-                    gain = delta.where(delta > 0, 0).rolling(period).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-                    rs = gain / loss.replace(0, np.nan)
-                    rsi_val = 100 - (100 / (1 + rs))
-
-                    # 超卖买入，超买卖出（均值回归）
-                    entries = rsi_val < oversold
-                    exits = rsi_val > overbought
-                    r = run_bt(close, entries, exits)
-                    if r and r['trades'] >= 2:
-                        results.append({
-                            'params_str': f'RSI({period},{oversold}/{overbought})',
-                            'params_raw': ('rsi', period, oversold, overbought),
-                            **r
-                        })
-        results.sort(key=lambda x: x['sharpe'], reverse=True)
-    else:
-        strat, period, oversold, overbought = params
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi_val = 100 - (100 / (1 + rs))
-        entries = rsi_val < oversold
-        exits = rsi_val > overbought
-        r = run_bt(close, entries, exits)
-        if r:
-            results.append(r)
-    return results
-
-def boll_strategy(data, params=None):
-    """布林带策略 - 均值回归"""
-    close = data['close'] if isinstance(data, pd.DataFrame) else data
-    results = []
-
-    if params is None:
-        for period in [15, 20, 25]:
-            for std_mul in [1.5, 2.0, 2.5]:
-                bb_mid = close.rolling(period).mean()
-                bb_std = close.rolling(period).std()
-                bb_upper = bb_mid + std_mul * bb_std
-                bb_lower = bb_mid - std_mul * bb_std
-
-                # 下轨买入，上轨卖出
-                entries = close < bb_lower
-                exits = close > bb_mid
-                r = run_bt(close, entries, exits)
-                if r and r['trades'] >= 2:
-                    results.append({
-                        'params_str': f'BOLL({period},{std_mul})',
-                        'params_raw': ('boll', period, std_mul),
-                        **r
-                    })
-        results.sort(key=lambda x: x['sharpe'], reverse=True)
-    else:
-        strat, period, std_mul = params
-        bb_mid = close.rolling(period).mean()
-        bb_std = close.rolling(period).std()
-        bb_upper = bb_mid + std_mul * bb_std
-        bb_lower = bb_mid - std_mul * bb_std
-        entries = close < bb_lower
-        exits = close > bb_mid
-        r = run_bt(close, entries, exits)
-        if r:
-            results.append(r)
-    return results
-
-def dmi_strategy(data, params=None):
-    """DMI趋势策略"""
-    close = data['close'] if isinstance(data, pd.DataFrame) else data
-    results = []
-
-    if params is None:
-        for period in [14, 20]:
-            for adx_th in [20, 25]:
-                try:
-                    high_d = data['high'] if isinstance(data, pd.DataFrame) else data
-                    low_d = data['low'] if isinstance(data, pd.DataFrame) else data
-
-                    tr1 = high_d - low_d
-                    tr2 = abs(high_d - close.shift(1))
-                    tr3 = abs(low_d - close.shift(1))
-                    tr = pd.concat([tr1.reset_index(drop=True),
-                                    tr2.reset_index(drop=True),
-                                    tr3.reset_index(drop=True)], axis=1).max(axis=1)
-                    atr_s = tr.rolling(period).mean()
-                    atr_s.index = close.index[:len(atr_s)]
-
-                    plus_dm = high_d.diff()
-                    minus_dm = -low_d.diff()
-                    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-                    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-                    plus_di = (plus_dm.rolling(period).mean() / atr_s.replace(0, np.nan)) * 100
-                    minus_di = (minus_dm.rolling(period).mean() / atr_s.replace(0, np.nan)) * 100
-                    dx = abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan) * 100
-                    adx_s = dx.rolling(period).mean()
-
-                    entries = (plus_di > minus_di) & (adx_s > adx_th)
-                    exits = (plus_di < minus_di) | (adx_s < adx_th - 5)
-
-                    r = run_bt(close, entries, exits)
-                    if r and r['trades'] >= 2:
-                        results.append({
-                            'params_str': f'DMI({period},ADX>{adx_th})',
-                            'params_raw': ('dmi', period, adx_th),
-                            **r
-                        })
-                except:
-                    continue
-        results.sort(key=lambda x: x['sharpe'], reverse=True)
-    else:
-        strat, period, adx_th = params
-        try:
-            high_d = data['high'] if isinstance(data, pd.DataFrame) else data
-            low_d = data['low'] if isinstance(data, pd.DataFrame) else data
-
-            tr1 = high_d - low_d
-            tr2 = abs(high_d - close.shift(1))
-            tr3 = abs(low_d - close.shift(1))
-            tr = pd.concat([tr1.reset_index(drop=True),
-                            tr2.reset_index(drop=True),
-                            tr3.reset_index(drop=True)], axis=1).max(axis=1)
-            atr_s = tr.rolling(period).mean()
-            atr_s.index = close.index[:len(atr_s)]
-
-            plus_dm = high_d.diff()
-            minus_dm = -low_d.diff()
-            plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-            minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-            plus_di = (plus_dm.rolling(period).mean() / atr_s.replace(0, np.nan)) * 100
-            minus_di = (minus_dm.rolling(period).mean() / atr_s.replace(0, np.nan)) * 100
-            dx = abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan) * 100
-            adx_s = dx.rolling(period).mean()
-
-            entries = (plus_di > minus_di) & (adx_s > adx_th)
-            exits = (plus_di < minus_di) | (adx_s < adx_th - 5)
-
-            r = run_bt(close, entries, exits)
-            if r:
-                results.append(r)
-        except:
-            return []
-    return results
-
-# ============ Walk-Forward 验证 ============
-
-def walk_forward_validate(df, strategy_fn, train_days=120, val_days=20, min_trades=2):
+def validate_signal_history(close, ind, signal_name, entries, exits, hold_days=5):
     """
-    Walk-Forward验证 + 参数稳定性过滤
+    核心功能：验证"这个信号"在历史上出现时，跟随它赚钱吗？
+
+    步骤：
+    1. entries: 历史上所有出现这个信号的日子（布尔Series）
+    2. 用VectorBT模拟：每次信号出现日买入，hold_days后卖出
+    3. 统计所有交易：胜率、平均收益、夏普
+
+    返回：验证结果字典
     """
-    close = df['close']
-    results = []
-    param_history = []
-
-    for i in range(train_days, len(close) - val_days, val_days):
-        train = close.iloc[:i]
-        val = close.iloc[i:i+val_days]
-
-        if len(train) < 80:
-            continue
-
-        try:
-            train_results = strategy_fn(train)
-            if not train_results:
-                continue
-
-            best = train_results[0]
-            best_params = best.get('params_raw')
-            best_str = best.get('params_str', '')
-
-            if not best_params or best.get('trades', 0) < min_trades:
-                continue
-
-            # 验证集回测
-            val_results = strategy_fn(val, best_params)
-            if not val_results:
-                continue
-
-            val_r = val_results[0]
-
-            # 放宽：只要有交易就算（1-2次交易也可能是有效的均值回归）
-            if val_r.get('trades', 0) < 1:
-                continue
-
-            param_history.append(best_str)
-
-            results.append({
-                'train_sharpe': best.get('sharpe', 0),
-                'val_sharpe': val_r.get('sharpe', 0),
-                'val_return': val_r.get('ret', 0),
-                'val_wr': val_r.get('wr', 0),
-                'val_trades': val_r.get('trades', 0),
-                'params': best_str
-            })
-        except Exception as e:
-            continue
-
-    if not results:
+    if entries.sum() < 3:
         return None
 
-    # 计算稳定性：参数在多少个窗口中重复
-    from collections import Counter
-    param_count = Counter(param_history)
-    most_common_params, most_common_count = param_count.most_common(1)[0]
-    stability = most_common_count / len(results)
+    try:
+        pf = vbt.Portfolio.from_signals(
+            close, entries, exits,
+            size=0.3, freq='1D',
+            fixed_fees=0.0003,
+            slippage=0.0002,
+            init_cash=100000
+        )
 
-    val_sharpes = [r['val_sharpe'] for r in results]
-    val_returns = [r['val_return'] for r in results]
-    val_wrs = [r['val_wr'] for r in results]
+        s = pf.stats()
+        eq = pf.value()
+        rets = eq.pct_change().dropna()
 
-    # 过滤：验证期夏普>0的结果比例
-    positive_ratio = sum(1 for r in results if r['val_sharpe'] > 0) / len(results)
+        trades = int(s['Total Trades'])
+        if trades < 1:
+            return None
 
-    return {
-        'avg_val_sharpe': np.mean(val_sharpes),
-        'avg_val_return': np.mean(val_returns),
-        'avg_val_wr': np.mean(val_wrs),
-        'avg_val_trades': np.mean([r['val_trades'] for r in results]),
-        'stability': stability,
-        'consistency': positive_ratio,
-        'n_periods': len(results),
-        'stable_params': most_common_params,
-        'latest_params': results[-1]['params'] if results else '',
-        'latest_val_sharpe': results[-1]['val_sharpe'] if results else 0,
-        'all_results': results
-    }
+        sharpe = rets.mean() / rets.std() * np.sqrt(250) if rets.std() > 0 else 0
+        wr = s['Win Rate [%]'] / 100 if not np.isnan(s['Win Rate [%]']) else 0
 
-def get_signal(ind, price):
-    score = 0.0
+        # 计算持仓期收益分布
+        entry_dates = entries[entries].index
+        period_returns = []
+        for ed in entry_dates:
+            try:
+                idx = close.index.get_loc(ed)
+                if idx + hold_days < len(close):
+                    ret = (close.iloc[idx + hold_days] / close.iloc[idx]) - 1
+                    period_returns.append(ret)
+            except:
+                continue
+
+        avg_hold_return = np.mean(period_returns) * 100 if period_returns else 0
+        win_rate_hold = np.mean([1 if r > 0 else 0 for r in period_returns]) if period_returns else 0
+
+        return {
+            'signal': signal_name,
+            'occurrences': int(entries.sum()),
+            'trades': trades,
+            'ret': s['Total Return [%]'],
+            'sharpe': sharpe,
+            'wr': wr,
+            'avg_hold_return': avg_hold_return,
+            'win_rate_hold': win_rate_hold,
+            'hold_days': hold_days,
+            'pf_obj': pf
+        }
+    except Exception as e:
+        return None
+
+# ============ 生成各类信号 ============
+
+def generate_all_signals(df, ind):
+    """生成所有策略的信号序列"""
+    close = df['close']
+    signals = {}
+
+    # 1. MA金叉（均线多头）
+    ma5 = ind['ma5']
+    ma20 = ind['ma20']
+    signals['MA_Golden'] = (ma5 > ma20) & (ma5.shift(1) <= ma20.shift(1))
+
+    # 2. MA死叉（均线空头）
+    signals['MA_Death'] = (ma5 < ma20) & (ma5.shift(1) >= ma20.shift(1))
+
+    # 3. RSI超卖
+    rsi = ind['rsi']
+    signals['RSI_Oversold'] = rsi < 30
+    signals['RSI_Edge'] = (rsi >= 30) & (rsi < 40)
+
+    # 4. RSI超买
+    signals['RSI_Overbought'] = rsi > 70
+    signals['RSI_Edge_Bear'] = (rsi <= 70) & (rsi > 60)
+
+    # 5. MACD柱转正
+    macd_hist = ind['macd_hist']
+    signals['MACD_Bull'] = (macd_hist > 0) & (macd_hist.shift(1) <= 0)
+
+    # 6. MACD柱转负
+    signals['MACD_Bear'] = (macd_hist < 0) & (macd_hist.shift(1) >= 0)
+
+    # 7. BOLL超卖
+    bb_lower = ind['bb_lower']
+    signals['BOLL_Oversold'] = close < bb_lower
+
+    # 8. BOLL偏下
+    bb_upper = ind['bb_upper']
+    bb_mid = ind['bb_mid']
+    bb_pos = (close - bb_lower) / (bb_upper - bb_lower + 0.001)
+    signals['BOLL_Low'] = (bb_pos < 0.2) & (bb_pos >= 0)
+
+    # 9. DMI多头
+    plus_di = ind['plus_di']
+    minus_di = ind['minus_di']
+    adx = ind['adx']
+    signals['DMI_Bull'] = (plus_di > minus_di) & (adx > 20)
+
+    # 10. DMI空头
+    signals['DMI_Bear'] = (plus_di < minus_di) & (adx > 20)
+
+    # 11. KDJ超卖
+    j_val = ind['j']
+    signals['KDJ_Oversold'] = j_val < 20
+
+    # 12. 布林开口放大（波动率爆发）
+    bb_width = (bb_upper - bb_lower) / bb_mid
+    signals['BOLL_Expand'] = bb_width > bb_width.rolling(10).mean() * 1.2
+
+    return signals
+
+def evaluate_signal_quality(close, ind, df, hold_days_list=[3, 5, 7]):
+    """
+    评估每个信号的历史表现
+    返回：信号排行榜
+    """
+    signals = generate_all_signals(df, ind)
+    results = []
+
+    for name, entries in signals.items():
+        if entries.sum() < 3:
+            continue
+
+        # 多持仓期验证
+        for hold_days in hold_days_list:
+            exits = entries.shift(hold_days).fillna(False)
+
+            r = validate_signal_history(close, ind, name, entries, exits, hold_days)
+            if r and r['trades'] >= 2:
+                results.append(r)
+
+    if not results:
+        return []
+
+    # 按夏普排序
+    results.sort(key=lambda x: x['sharpe'], reverse=True)
+    return results
+
+def get_current_signals(ind, price):
+    """获取当前激活的信号"""
+    active = []
     reasons = []
 
     ma5 = ind['ma5'].iloc[-1]
     ma20 = ind['ma20'].iloc[-1]
-    ma30 = ind['ma30'].iloc[-1]
     ma60 = ind['ma60'].iloc[-1]
-
-    if price > ma5:
-        score += 0.1
-    else:
-        score -= 0.1
-        reasons.append("价格<MA5")
-
-    if ma5 > ma20 > ma30:
-        score += 0.25
-        reasons.append("均线多头排列")
-    elif ma5 < ma20 < ma30:
-        score -= 0.25
-        reasons.append("均线空头排列")
-
-    if ma20 > ma60:
-        score += 0.1
-        reasons.append("MA20>MA60多头")
-    elif ma20 < ma60:
-        score -= 0.1
-        reasons.append("MA20<MA60空头")
-
-    if ind['macd_hist'].iloc[-1] > 0:
-        score += 0.15
-        reasons.append("MACD柱正向")
-    else:
-        score -= 0.15
-        reasons.append("MACD柱负向")
-
-    if ind['macd'].iloc[-1] > ind['signal'].iloc[-1]:
-        score += 0.1
-    else:
-        score -= 0.1
-
     rsi = ind['rsi'].iloc[-1]
-    if rsi < 30:
-        score += 0.3
-        reasons.append(f"RSI超卖({rsi:.0f})")
-    elif rsi > 70:
-        score -= 0.3
-        reasons.append(f"RSI超买({rsi:.0f})")
-    elif rsi < 40:
-        score += 0.1
-        reasons.append(f"RSI偏弱({rsi:.0f})")
-    elif rsi > 60:
-        score -= 0.1
-        reasons.append(f"RSI偏强({rsi:.0f})")
-
-    bb_upper = ind['bb_upper'].iloc[-1]
-    bb_lower = ind['bb_lower'].iloc[-1]
-    bb_pos = (price - bb_lower) / (bb_upper - bb_lower + 0.001) * 100
-    if bb_pos < 20:
-        score += 0.25
-        reasons.append(f"BOLL超卖({bb_pos:.0f}%)")
-    elif bb_pos > 80:
-        score -= 0.25
-        reasons.append(f"BOLL超买({bb_pos:.0f}%)")
-
+    bb_pos = (price - ind['bb_lower'].iloc[-1]) / (ind['bb_upper'].iloc[-1] - ind['bb_lower'].iloc[-1] + 0.001) * 100
     plus_di = ind['plus_di'].iloc[-1]
     minus_di = ind['minus_di'].iloc[-1]
     adx = ind['adx'].iloc[-1]
-
-    if plus_di > minus_di:
-        score += 0.15
-        reasons.append(f"DMI多头(+{plus_di:.1f}/-{minus_di:.1f})")
-    else:
-        score -= 0.15
-        reasons.append(f"DMI空头(+{plus_di:.1f}/-{minus_di:.1f})")
-
-    if adx > 25:
-        score *= 1.15
-        reasons.append(f"ADX强趋势({adx:.1f})")
-    elif adx < 20:
-        score *= 0.8
-        reasons.append(f"ADX震荡({adx:.1f})")
-
+    macd_hist = ind['macd_hist'].iloc[-1]
     j_val = ind['j'].iloc[-1]
-    if j_val < 20:
-        score += 0.15
-        reasons.append(f"KDJ超卖({j_val:.0f})")
-    elif j_val > 80:
-        score -= 0.15
-        reasons.append(f"KDJ超买({j_val:.0f})")
+
+    # 记录所有激活的信号
+    if price < ma5: active.append("价格<MA5")
+    if ma5 < ma20: active.append("MA空头")
+    if ma20 < ma60: active.append("MA20<MA60空头")
+    if macd_hist < 0: active.append("MACD柱负向")
+    if rsi < 30: active.append(f"RSI超卖({rsi:.0f})")
+    elif rsi < 40: active.append(f"RSI偏弱({rsi:.0f})")
+    if rsi > 70: active.append(f"RSI超买({rsi:.0f})")
+    elif rsi > 60: active.append(f"RSI偏强({rsi:.0f})")
+    if bb_pos < 20: active.append(f"BOLL超卖({bb_pos:.0f}%)")
+    if plus_di < minus_di: active.append(f"DMI空头")
+    if adx > 25: active.append(f"ADX强趋势({adx:.0f})")
+    if j_val < 20: active.append(f"KDJ超卖({j_val:.0f})")
+    if j_val > 80: active.append(f"KDJ超买({j_val:.0f})")
+
+    # 综合评分
+    score = 0.0
+    if price > ma5: score += 0.1
+    else: score -= 0.1
+
+    if ma5 > ma20 > ind['ma30'].iloc[-1]:
+        score += 0.25
+    elif ma5 < ma20 < ind['ma30'].iloc[-1]:
+        score -= 0.25
+
+    if macd_hist > 0: score += 0.15
+    else: score -= 0.15
+
+    if rsi < 30: score += 0.3
+    elif rsi > 70: score -= 0.3
+    elif rsi < 40: score += 0.1
+    elif rsi > 60: score -= 0.1
+
+    if bb_pos < 20: score += 0.25
+    elif bb_pos > 80: score -= 0.25
+
+    if plus_di > minus_di: score += 0.15
+    else: score -= 0.15
+
+    if adx > 25: score *= 1.15
+    elif adx < 20: score *= 0.8
+
+    if j_val < 20: score += 0.15
+    elif j_val > 80: score -= 0.15
 
     vol = ind['vol'].iloc[-1]
-    if vol > 0.25:
-        score *= 0.8
-        reasons.append("高波动减权")
-    elif vol < 0.10:
-        score *= 0.9
-        reasons.append("低波动减权")
+    if vol > 0.25: score *= 0.8
+    elif vol < 0.10: score *= 0.9
 
     score = max(-1.0, min(1.0, score))
 
-    if score >= 0.5:
-        sig = "BUY"
-    elif score <= -0.5:
-        sig = "SELL"
-    else:
-        sig = "HOLD"
+    if score >= 0.5: sig = "BUY"
+    elif score <= -0.5: sig = "SELL"
+    else: sig = "HOLD"
 
-    return sig, score, abs(score), reasons
+    return sig, score, abs(score), active
 
 def kelly_formula(win_rate, avg_win_pct, avg_loss_pct):
     aw = max(avg_win_pct, 0.001)
@@ -579,137 +385,98 @@ def kelly_formula(win_rate, avg_win_pct, avg_loss_pct):
     k = (win_rate * wl_ratio - (1 - win_rate)) / wl_ratio
     return max(0.05, min(0.7, abs(k) * 0.5))
 
-def count_bullish(ind, price):
-    count = 0
-    if ind['ma5'].iloc[-1] > ind['ma20'].iloc[-1]:
-        count += 1
-    if ind['macd_hist'].iloc[-1] > 0:
-        count += 1
-    if ind['rsi'].iloc[-1] < 40:
-        count += 1
-    if ind['plus_di'].iloc[-1] > ind['minus_di'].iloc[-1]:
-        count += 1
-    if ind['j'].iloc[-1] < 30:
-        count += 1
-    return count
-
 def run():
     print("=" * 70)
-    print("  股神2号 v5.4 | 自适应策略系统")
-    print("  核心理念：市场状态自适应 + 参数稳定性过滤")
+    print("  股神2号 v5.5 | 信号历史验证系统")
+    print("  核心问题：今天的信号，历史胜率多少？")
     print("=" * 70)
 
-    print("\n[1/5] 获取数据...")
+    print("\n[1/4] 获取数据...")
     df = get_data(500)
     price = get_rt() or df['close'].iloc[-1]
     n = len(df)
     print(f"   {n}条 | {df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}")
     print(f"   实时价格: {price:.0f}")
 
-    print("\n[2/5] 计算指标...")
+    print("\n[2/4] 计算指标...")
     ind = calc_indicators(df)
 
     market_state = ind['market_state']
     trend_20d = ind['trend_20d'] * 100
-    state_icon = {'up': 'UP', 'down': 'DOWN', 'range': 'RANGE'}
-    print(f"\n   市场状态: [{state_icon[market_state]}] (20日趋势: {trend_20d:+.1f}%)")
+    state_map = {'up': 'UP', 'down': 'DOWN', 'range': 'RANGE'}
+    print(f"\n   市场状态: [{state_map[market_state]}] (20日趋势: {trend_20d:+.1f}%)")
 
-    print("\n[3/5] Walk-Forward滚动验证 (训练120天/验证20天)...")
+    print("\n[3/4] 信号历史验证...")
+    print("  问题：这些信号在历史上出现时，跟随它赚钱吗？")
     print("-" * 70)
 
-    train_days = 120
-    val_days = 20
+    # 评估所有信号
+    signal_results = evaluate_signal_quality(df['close'], ind, df, hold_days_list=[3, 5, 7])
 
-    # 根据市场状态选择策略优先级
-    if market_state == 'down':
-        # 下跌趋势：均值回归优先
-        strategies = [('RSI', rsi_strategy), ('BOLL', boll_strategy), ('MACD', macd_strategy), ('MA', ma_strategy), ('DMI', dmi_strategy)]
-        print("   市场下跌：优先验证均值回归策略(RSI/BOLL)")
-    elif market_state == 'up':
-        # 上涨趋势：趋势跟踪优先
-        strategies = [('MACD', macd_strategy), ('MA', ma_strategy), ('DMI', dmi_strategy), ('RSI', rsi_strategy), ('BOLL', boll_strategy)]
-        print("   市场上涨：优先验证趋势跟踪策略(MACD/MA)")
+    if signal_results:
+        print(f"\n  {'信号':<18} {'历史次数':>8} {'胜率':>7} {'平均持有收益':>12} {'夏普':>7}")
+        print("  " + "-" * 56)
+
+        shown = set()
+        count = 0
+        for r in signal_results:
+            if r['signal'] in shown:
+                continue
+            shown.add(r['signal'])
+            wr = r['win_rate_hold'] * 100
+            icon = "OK" if wr > 50 else "WARN" if wr > 30 else "BAD"
+            print(f"  {r['signal']:<18} {r['occurrences']:>6} {wr:>6.0f}% {r['avg_hold_return']:>+10.1f}% {r['sharpe']:>6.2f} [{icon}]")
+            count += 1
+            if count >= 10:
+                break
+
+        print()
+
+        # 找最佳信号
+        best = signal_results[0]
+        print(f"  >> 最佳信号: {best['signal']}")
+        print(f"     历史胜率: {best['win_rate_hold']*100:.0f}% | 持有{best['hold_days']}天平均: {best['avg_hold_return']:+.1f}%")
+        print(f"     历史出现: {best['occurrences']}次 | 夏普: {best['sharpe']:.2f}")
     else:
-        strategies = [('RSI', rsi_strategy), ('BOLL', boll_strategy), ('MACD', macd_strategy), ('MA', ma_strategy), ('DMI', dmi_strategy)]
-        print("   市场震荡：验证所有策略")
-
-    print()
-
-    strategy_results = {}
-    for name, fn in strategies:
-        print(f"  {name}...", end=" ", flush=True)
-        wf = walk_forward_validate(df, fn, train_days=train_days, val_days=val_days)
-        if wf and wf['n_periods'] > 0:
-            strategy_results[name] = wf
-            icon = "OK" if wf['consistency'] > 0.5 else "WARN"
-            print(f"验证夏普={wf['avg_val_sharpe']:.2f} 胜率={wf['avg_val_wr']*100:.0f}% 稳定性={wf['stability']:.0%} [{icon}]")
-        else:
-            print("数据不足")
-
-    print()
-
-    # 全局最优（基于验证期夏普）
-    if strategy_results:
-        best_name = max(strategy_results.keys(), key=lambda k: strategy_results[k]['avg_val_sharpe'])
-        best = strategy_results[best_name]
-
-        # 稳定性过滤：稳定性<40%的策略不推荐
-        stable_enough = best['stability'] >= 0.4
-
-        print(f"  >> 全局验证期最优: {best_name}策略")
-        print(f"     验证夏普: {best['avg_val_sharpe']:.2f} | 胜率: {best['avg_val_wr']*100:.0f}%")
-        print(f"     稳定性: {best['stability']:.0%} | 一致性: {best['consistency']:.0%}")
-        print(f"     稳定参数: {best['stable_params']}")
-        print(f"     最新参数: {best['latest_params']}")
-
-        if not stable_enough:
-            print(f"\n  ⚠️ 最佳策略稳定性不足({best['stability']:.0%}<40%)，信号降权")
-
-        # 第二名策略（用于共振）
-        if len(strategy_results) > 1:
-            sorted_results = sorted(strategy_results.items(), key=lambda x: x[1]['avg_val_sharpe'], reverse=True)
-            if len(sorted_results) >= 2:
-                second = sorted_results[1]
-                print(f"     次优: {second[0]}策略 (夏普={second[1]['avg_val_sharpe']:.2f})")
-    else:
-        best_name = 'RSI'
         best = None
-        print("  >> 所有策略数据不足，使用默认RSI")
+        print("  信号数据不足")
 
-    print("\n[4/5] 实时信号生成...")
+    print("\n[4/4] 实时信号 + 置信度...")
 
-    sig, sc, conf, reasons = get_signal(ind, price)
+    sig, sc, conf, reasons = get_current_signals(ind, price)
     icon_map = {'BUY': 'BUY', 'SELL': 'SELL', 'HOLD': 'HOLD'}
-    print(f"\n  综合信号: [{icon_map[sig]}] (置信度{conf:.0%})")
-    print(f"  评分: {sc:+.2f}")
+    print(f"\n  综合信号: [{icon_map[sig]}] (指标评分置信度: {conf:.0%})")
+    print(f"  指标评分: {sc:+.2f}")
 
-    bullish_count = count_bullish(ind, price)
-    print(f"  多头共振: {bullish_count}/5指标")
+    # 基于历史信号调整置信度
+    if best and best['win_rate_hold'] > 0:
+        hist_conf = best['win_rate_hold']
+        # 综合：指标评分 + 历史胜率
+        combined_conf = conf * 0.5 + hist_conf * 0.5
+        print(f"\n  历史置信度: {hist_conf:.0%} (基于{best['occurrences']}次历史验证)")
+        print(f"  综合置信度: {conf:.0%} × 50% + {hist_conf:.0%} × 50% = {combined_conf:.0%}")
+    else:
+        combined_conf = conf
+        print(f"\n  综合置信度: {conf:.0%}")
 
     if reasons:
-        print(f"  信号依据:")
+        print(f"\n  当前活跃信号: {len(reasons)}个")
         for r in reasons[:5]:
             print(f"    - {r}")
 
-    # 策略置信度
-    if best and best.get('consistency', 0) > 0:
-        wf_factor = min(best['consistency'], 1.0)
-        stability_factor = best['stability']
-        combined_factor = (wf_factor * 0.6 + stability_factor * 0.4)
-        adj_conf = conf * (0.4 + 0.6 * combined_factor)
-        print(f"\n  WF置信度调整: {conf:.0%} × {combined_factor:.2f} = {adj_conf:.0%}")
-        print(f"     (验证一致性: {best['consistency']:.0%}, 参数稳定性: {best['stability']:.0%})")
-
-    print("\n[5/5] 风控+仓位...")
+    # 风控
+    print("\n" + "-" * 70)
+    print("【风控+仓位】")
+    print("-" * 70)
 
     atr = ind['atr'].iloc[-1]
     vol = ind['vol'].iloc[-1]
     pos_mult = 0.5 if vol > 0.20 else (0.7 if vol > 0.10 else 1.0)
 
-    if best and best['avg_val_wr'] > 0:
-        wr = best['avg_val_wr']
-        avg_ret = best['avg_val_return'] / max(best['n_periods'], 1)
-        k = kelly_formula(wr, avg_ret, 0.03)
+    if best and best['win_rate_hold'] > 0:
+        wr = best['win_rate_hold']
+        avg_ret = best['avg_hold_return']
+        k = kelly_formula(wr, avg_ret, 3.0)
     else:
         k = 0.3
 
@@ -717,8 +484,8 @@ def run():
 
     print(f"  ATR: {atr:.0f} | 波动率: {vol:.0%}")
     if best:
-        print(f"  最优策略: {best_name} (验证胜率: {best['avg_val_wr']*100:.0f}%)")
-    print(f"  建议仓位: {max_pos*100:.1f}%")
+        print(f"  最佳信号: {best['signal']} (历史胜率: {best['win_rate_hold']*100:.0f}%)")
+    print(f"  凯利仓位: {k*100:.0f}% → 建议: {max_pos*100:.1f}%")
 
     if sig == 'BUY':
         sl = price - 2 * atr
@@ -726,32 +493,27 @@ def run():
         print(f"\n  [BUY] {price:.0f}")
         print(f"        止损: {sl:.0f} (-{2*atr/price*100:.1f}%)")
         print(f"        止盈: {tp:.0f} (+{3*atr/price*100:.1f}%)")
-        print(f"        建议仓位: {max_pos*100:.1f}%")
     elif sig == 'SELL':
         sl = price + 2 * atr
         tp = price - 3 * atr
         print(f"\n  [SELL] {price:.0f}")
         print(f"        止损: {sl:.0f} (+{2*atr/price*100:.1f}%)")
         print(f"        止盈: {tp:.0f} (-{3*atr/price*100:.1f}%)")
-        print(f"        建议仓位: {max_pos*100:.1f}%")
     else:
         print(f"\n  [HOLD] 观望")
 
-    print(f"\n  关键价位:")
-    print(f"     支撑: {ind['bb_lower'].iloc[-1]:.0f} / {ind['ma20'].iloc[-1]:.0f}")
-    print(f"     当前: {price:.0f}")
-    print(f"     压力: {ind['bb_upper'].iloc[-1]:.0f}")
+    print(f"\n  关键价位: {ind['bb_lower'].iloc[-1]:.0f} / {price:.0f} / {ind['bb_upper'].iloc[-1]:.0f}")
 
     print("\n" + "=" * 70)
-    print("【v5.4 核心升级】")
+    print("【v5.5 核心升级】")
     print("=" * 70)
     print("""
-  ✅ Walk-Forward滚动验证(120天训练/20天验证)
-  ✅ 参数稳定性过滤(参数在连续窗口保持一致=可靠)
-  ✅ 市场状态自适应(下跌趋势用RSI/BOLL，上涨用MACD/MA)
-  ✅ RSI+BOLL双均值回归策略
-  ✅ 策略共振：同时参考最优+次优策略
-  ✅ 置信度动态调整
+  ✅ 信号历史验证：不再问"哪个参数最优"
+  ✅ 问："今天这个信号，历史胜率多少？"
+  ✅ VectorBT批量验证每个信号的历史表现
+  ✅ 多持仓期验证(3/5/7天)
+  ✅ 历史胜率 + 指标评分 → 综合置信度
+  ✅ 直接告诉您：这个信号历史上跟着做赚了多少钱
 """)
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
