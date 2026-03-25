@@ -1,19 +1,14 @@
-# 排除临时文件和工作产出
-*.log
-*.tmp
-*.cache
-.DS_Store
-node_modules/
-dist/
-build/
+# 排除频繁变化的数据文件
+logs/*.txt
+logs/*.log
+data/
+.clawhub/
+.openclaw/
 __pycache__/
 *.pyc
+*.log
+*.tmp
+.DS_Store
 
-# 排除用户敏感信息（token等）
-.env
-.env.*
-*token*
-*secret*
-
-# 保留技能目录
-# 保留核心配置文件
+# 保留核心Python文件（显式排除）
+# 这些文件会被git追踪
