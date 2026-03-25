@@ -30,7 +30,7 @@ from openai import OpenAI
 
 # ============ 配置 ============
 TUSHARE_TOKEN = '14d6be29b1b0b8a930fc488ceb343859b60f1357a1e1a85dcaee3712'
-OPENAI_API_KEY = 'sk-cp-PdInlTwLhgtz3FvquCV2suVp0ZpKjS7RmAXbjAxgBQPF5vgyZO03B_jwID9wxjfC6pX-QcWTKEsJ40zkuo-l2GnpGCTVR6s098_qDKDOn2h8PKiRAGJvByo'
+OPENAI_API_KEY = 'sk-api-ajVztMXXnsZz1nbFav0qTdZs4aSLt0B7t0rUvrW2ZBzFnZ24_OS3PeiP-Y92PkKYKs6RwQkAFxW4m4gBtUm8xJcSdMfzKwGj2yeqqbIerxQeyEmF1Ltjm9Q'
 OPENAI_BASE_URL = 'https://api.minimax.chat/v1'
 
 # LLM Client

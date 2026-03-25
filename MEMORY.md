@@ -6,19 +6,28 @@
 - 用户：崔哥（企业主，期货超短线）
 - 当前重点：AG2606 白银期货
 
-## 数据源（写死）
-- **Tushare Pro Token:** `14d6be29b1b0b8a930fc488ceb343859b60f1357a1e1a85dcaee3712`
-- 实时: `rt_fut_min` | 历史: `fut_daily`
-- 状态: ✅ 正常
+## 盯盘系统（默认使用v6.0）
+- **主程序**: `trading_system_v6.py`
+- **框架**: TradingAgents多智能体 + VectorBT回测过滤
+- **LLM**: MiniMax (abab6-chat)
+- **API Key**: sk-api-ajVztMXXnsZz1nbFav0qTdZs4aSLt0B7t0rUvrW2ZBzFnZ24_OS3PeiP-Y92PkKYKs6RwQkAFxW4m4gBtUm8xJcSdMfzKwGj2yeqqbIerxQeyEmF1Ltjm9Q
+- **数据**: Tushare Pro Token: 14d6be29b1b0b8a930fc488ceb343859b60f1357a1e1a85dcaee3712
+- **盯盘间隔**: 每2分钟，交易时段: 9:30-11:30 / 13:30-15:00 / 21:00-02:00
 
-## 盯盘配置
-- 每2分钟，9:30-11:30 / 13:30-15:00 / 21:00-02:00
-- 脚本: `scripts/run_evolved.sh` → v5.1系统
+## 核心架构（TradingAgents + VectorBT）
+```
+Agent 1: 技术分析师 → 技术指标评分
+Agent 2: 多头研究员 → VectorBT验证做多信号
+Agent 3: 空头研究员 → VectorBT验证做空信号
+Agent 4: 交易员 → LLM辩论决策
+Agent 5: 风控经理 → 仓位/止损计算
+Agent 6: 投资组合经理 → 最终审批
+```
 
 ## 核心文件
 ```bash
-# 推荐主程序
-python3 /root/.openclaw/workspace/trading_system_v5.py
+# 默认盯盘程序
+python3 /root/.openclaw/workspace/trading_system_v6.py
 
 # 查看状态
 cat /root/.openclaw/workspace/logs/latest_status.txt
@@ -30,20 +39,7 @@ cat /root/.openclaw/workspace/logs/latest_status.txt
 | MA | MA(3/20) | 109.5% | 2.42 | 50% |
 | RSI | RSI(10,30/80) | 19.8% | 0.94 | 100% |
 | MACD | MACD(8,30,9) | 96.5% | 2.45 | 40% |
-| **DMI** | **DMI(14,ADX>20)** | **95.6%** | **2.33** | **80%** |
-
-🏆 全局最优: MACD(8,30,9) 夏普2.45
-
-## 当前信号（观望）
-- 信号: HOLD (30%)
-- 价格: ~18111
-- 评分: -0.30
-- 波动率: 92%（极高）
-- 仓位上限: 35%
-
-## 关键价位
-- 支撑: 16099（布林下轨）, 20568（MA20）
-- 压力: 25038（布林上轨）
+| DMI | DMI(14,ADX>20) | 95.6% | 2.33 | 80% |
 
 ## GitHub
 - 仓库: https://github.com/cuihaoxin1983/gushen2-backup
