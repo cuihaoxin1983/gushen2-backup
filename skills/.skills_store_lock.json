@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "self-improving": {
+      "name": "Self-Improving + Proactive Agent",
+      "zip_url": "https://lightmake.site/api/v1/download?slug=self-improving",
+      "source": "skillhub",
+      "version": "1.2.16"
+    }
+  }
+}

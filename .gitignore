@@ -1,0 +1,19 @@
+# 排除临时文件和工作产出
+*.log
+*.tmp
+*.cache
+.DS_Store
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+
+# 排除用户敏感信息（token等）
+.env
+.env.*
+*token*
+*secret*
+
+# 保留技能目录
+# 保留核心配置文件
